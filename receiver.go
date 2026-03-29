@@ -1,145 +1,139 @@
 package main
 
 import (
-	"bufio"
+	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
 )
 
-type HostInfo struct {
-	addr string
-	name string
-	size int64
-}
-
 func runReceiver(dest string) {
-	pc, err := net.ListenPacket("udp", protocolPort)
+	addr, _ := net.ResolveUDPAddr("udp", ":"+ProtocolPort)
+	pc, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		fmt.Println("Error: port 9999 is busy")
 		return
 	}
 	defer pc.Close()
 
-	fmt.Println("Searching for local hosts (3s)...")
+	stopAnim := make(chan bool)
+	go animateText("Searching for local hosts", stopAnim)
 
-	hostsMap := make(map[string]HostInfo)
-
-	deadline := time.Now().Add(3 * time.Second)
-	pc.SetReadDeadline(deadline)
-
+	hosts := make(map[string]HostInfo)
+	pc.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 2048)
+
 	for {
-		n, addr, err := pc.ReadFrom(buf)
+		n, remoteAddr, err := pc.ReadFrom(buf)
 		if err != nil {
 			break
 		}
-
-		msg := string(buf[:n])
-		if info, ok := parseMsg(msg, addr); ok {
-			hostsMap[info.addr] = info
+		if info, ok := parseMsg(string(buf[:n]), remoteAddr); ok {
+			hosts[info.addr] = info
 		}
 	}
+	stopAnim <- true
 
-	if len(hostsMap) == 0 {
+	if len(hosts) == 0 {
 		fmt.Println("No active hosts found.")
 		return
 	}
 
-	indexedHosts := make([]HostInfo, 0, len(hostsMap))
+	indexed := []HostInfo{}
 	fmt.Println("\nAvailable files:")
-	i := 1
-	for _, h := range hostsMap {
-		fmt.Printf("[%d] %s (%s) - %d bytes\n", i, h.name, h.addr, h.size)
-		indexedHosts = append(indexedHosts, h)
-		i++
+	for _, h := range hosts {
+		fmt.Printf("[%d] %s (%d bytes) - %s\n", len(indexed)+1, h.name, h.size, h.addr)
+		indexed = append(indexed, h)
 	}
 
-	fmt.Print("\nEnter ID to download: ")
+	fmt.Print("\nSelect ID: ")
 	var input string
 	fmt.Scanln(&input)
+	idx, _ := strconv.Atoi(input)
 
-	idx, err := strconv.Atoi(input)
-	if err != nil || idx < 1 || idx > len(indexedHosts) {
-		fmt.Println("Invalid ID. Canceled.")
-		return
+	if idx > 0 && idx <= len(indexed) {
+		downloadFile(indexed[idx-1], dest)
 	}
-
-	target := indexedHosts[idx-1]
-	downloadFile(target, dest)
-}
-
-func parseMsg(msg string, remote net.Addr) (HostInfo, bool) {
-	p := strings.Split(msg, "|")
-	if len(p) < 4 || p[0] != signature {
-		return HostInfo{}, false
-	}
-
-	ip, _, _ := net.SplitHostPort(remote.String())
-	targetPort := p[1]
-	size, _ := strconv.ParseInt(p[3], 10, 64)
-
-	return HostInfo{
-		addr: ip + ":" + targetPort,
-		name: p[2],
-		size: size,
-	}, true
 }
 
 func downloadFile(h HostInfo, dest string) {
-	conn, err := net.DialTimeout("tcp", h.addr, 5*time.Second)
+	_ = os.MkdirAll(dest, 0755)
+	finalPath := filepath.Join(dest, h.name)
+
+	f, _ := os.OpenFile(finalPath, os.O_CREATE|os.O_RDWR, 0644)
+	defer f.Close()
+
+	currentSize := int64(0)
+	if stat, err := os.Stat(finalPath); err == nil {
+		currentSize = stat.Size()
+	}
+	if currentSize > h.size {
+		f.Truncate(h.size)
+	} else if currentSize < h.size {
+		f.Truncate(h.size)
+	}
+
+	numThreads := 4
+	chunkSize := h.size / int64(numThreads)
+	var wg sync.WaitGroup
+	bar := newProgressBar(h.size, "Downloading")
+
+	for i := 0; i < numThreads; i++ {
+		wg.Add(1)
+		start := int64(i) * chunkSize
+		end := start + chunkSize
+		if i == numThreads-1 {
+			end = h.size
+		}
+		go func(s, e int64) {
+			defer wg.Done()
+			downloadChunk(h.addr, s, e, f, bar)
+		}(start, end)
+	}
+	wg.Wait()
+
+	stopHash := make(chan bool)
+	fmt.Print("\n")
+	go animateText("Verifying SHA-256", stopHash)
+	newHash, _ := calculateHash(finalPath)
+	stopHash <- true
+
+	if newHash == h.hash {
+		fmt.Printf("\rSuccess. Hash Match: %s\n", newHash[:8])
+	} else {
+		fmt.Printf("\rFailure. Hash Mismatch!\n")
+	}
+}
+
+func downloadChunk(addr string, start, end int64, outF *os.File, bar *progressbar.ProgressBar) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		fmt.Println("Connection failed:", err)
 		return
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
-	r := bufio.NewReader(conn)
-	_, _ = r.ReadString('\n')
+	header := make([]byte, HeaderSize)
+	binary.BigEndian.PutUint64(header[:8], uint64(start))
+	binary.BigEndian.PutUint64(header[8:], uint64(end-start))
+	conn.Write(header)
 
-	_ = os.MkdirAll(dest, 0755)
-
-	finalPath := filepath.Join(dest, h.name)
-
-	if _, err := os.Stat(finalPath); err == nil {
-		finalPath = filepath.Join(dest, "new_"+h.name)
-	}
-
-	f, err := os.Create(finalPath)
-	if err != nil {
-		fmt.Println("File error:", err)
-		return
-	}
-	defer f.Close()
-
-	bar := progressbar.NewOptions64(
-		h.size,
-		progressbar.OptionSetDescription("Downloading "+h.name),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-	)
-
-	_, err = io.Copy(io.MultiWriter(f, bar), r)
-
-	if err == nil {
-		conn.Write([]byte("ACK\n"))
-		fmt.Printf("\nSuccess: %s saved\n", h.name)
-	} else {
-		fmt.Printf("\nError during download: %v\n", err)
+	buf := make([]byte, BufferSize)
+	pos := start
+	for pos < end {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			outF.WriteAt(buf[:n], pos)
+			pos += int64(n)
+			bar.Add(n)
+		}
+		if err != nil {
+			break
+		}
 	}
 }
