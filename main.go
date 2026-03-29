@@ -2,33 +2,34 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
 	asciiArt()
-	printUsage()
+	rootCtx, cancelAll := context.WithCancel(context.Background())
+	defer cancelAll()
 
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		fmt.Print("> ")
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
-
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-
 		args := strings.Fields(line)
 		cmd := strings.ToLower(args[0])
-
 		switch cmd {
+		case "help":
+			printUsage()
 		case "gfs":
 			if len(args) < 2 {
 				fmt.Println("Usage: gfs [send|get]")
@@ -40,7 +41,7 @@ func main() {
 					fmt.Println("Error: specify file path")
 					continue
 				}
-				go runSender(args[2])
+				go runSender(rootCtx, args[2])
 			} else if action == "get" {
 				dest := "."
 				if len(args) >= 3 {
@@ -49,27 +50,11 @@ func main() {
 				runReceiver(dest)
 			}
 		case "exit", "quit":
-			fmt.Println("Bye.")
+			cancelAll()
+			time.Sleep(200 * time.Millisecond)
 			return
 		default:
-			fmt.Println("Unknown command. Type 'exit' to quit.")
+			fmt.Printf("Unknown command: %s\n", cmd)
 		}
 	}
-}
-
-func asciiArt() {
-	fmt.Println("\033[36m" + `
-   ______ ______ _____ 
-  / ____// ____// ___/ 
- / / __ / /_    \__ \  
-/ /_/ // __/   ___/ /  
-\____//_/     /____/   
-
- High Performance File Transfer` + "\033[0m\n")
-}
-
-func printUsage() {
-	fmt.Println("  gfs send <path>  - Start hosting a file")
-	fmt.Println("  gfs get <dest>   - Scan and download a file")
-	fmt.Println("  exit             - Close application\n")
 }
