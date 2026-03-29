@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -9,58 +11,53 @@ import (
 	"time"
 )
 
-const (
-	signature      = "GFS_V1"
-	protocolPort   = ":9999"
-	maxConnections = 5
-)
-
-func runSender(path string) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		fmt.Println("Invalid path:", err)
-		return
-	}
-
+func runSender(ctx context.Context, path string) {
+	absPath, _ := filepath.Abs(path)
 	fileInfo, err := os.Stat(absPath)
 	if err != nil {
 		fmt.Println("File error:", err)
 		return
 	}
 
+	stopAnim := make(chan bool)
+	go animateText("Calculating SHA-256", stopAnim)
+	fileHash, _ := calculateHash(absPath)
+	stopAnim <- true
+
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		fmt.Println("Listen error:", err)
 		return
 	}
-	defer ln.Close()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
 
 	port := ln.Addr().(*net.TCPAddr).Port
-	fmt.Printf("[Host] Sharing %s on port %d\n", fileInfo.Name(), port)
+	fmt.Printf("\r[Host] %s (Port: %d, Hash: %s[:8])\n", fileInfo.Name(), port, fileHash[:8])
 
-	go broadcast(port, fileInfo.Name(), fileInfo.Size())
+	go startBroadcaster(ctx, port, fileInfo.Name(), fileInfo.Size(), fileHash)
 
-	sem := make(chan struct{}, maxConnections)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			continue
+			return
 		}
-
-		sem <- struct{}{}
-		go func(c net.Conn) {
-			defer func() { <-sem; c.Close() }()
-			handleClient(c, absPath, fileInfo.Name(), fileInfo.Size())
-		}(conn)
+		go handleClient(conn, absPath)
 	}
 }
 
-func handleClient(conn net.Conn, fullPath, name string, size int64) {
-	header := fmt.Sprintf("%s|%d\n", name, size)
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if _, err := conn.Write([]byte(header)); err != nil {
+func handleClient(conn net.Conn, fullPath string) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(1 * time.Minute))
+
+	header := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(conn, header); err != nil {
 		return
 	}
+
+	offset := int64(binary.BigEndian.Uint64(header[:8]))
+	length := int64(binary.BigEndian.Uint64(header[8:]))
 
 	f, err := os.Open(fullPath)
 	if err != nil {
@@ -68,31 +65,9 @@ func handleClient(conn net.Conn, fullPath, name string, size int64) {
 	}
 	defer f.Close()
 
-	fmt.Printf("[Host] Sending to %s...\n", conn.RemoteAddr())
-	_, err = io.Copy(conn, f)
-	if err != nil {
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return
 	}
 
-	buf := make([]byte, 4)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, _ := conn.Read(buf)
-	if string(buf[:n]) == "ACK\n" {
-		fmt.Printf("[Host] Success: %s received the file\n", conn.RemoteAddr())
-	}
-}
-
-func broadcast(port int, name string, size int64) {
-	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255"+protocolPort)
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	msg := fmt.Sprintf("%s|%d|%s|%d", signature, port, name, size)
-	for {
-		conn.Write([]byte(msg))
-		time.Sleep(3 * time.Second)
-	}
+	io.CopyN(conn, f, length)
 }
