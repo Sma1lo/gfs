@@ -1,11 +1,12 @@
 # gfs
 
-![Go](https://img.shields.io/badge/language-Go-00ADD8)
+![Go Version](https://img.shields.io/github/go-mod/go-version/Sma1lo/gfs)
 ![License](https://img.shields.io/github/license/Sma1lo/gfs)
 ![Release](https://img.shields.io/github/v/release/Sma1lo/gfs)
 ![Downloads](https://img.shields.io/github/downloads/Sma1lo/gfs/total)
 ![Last Commit](https://img.shields.io/github/last-commit/Sma1lo/gfs)
 ![Repo Size](https://img.shields.io/github/repo-size/Sma1lo/gfs)
+![Issues](https://img.shields.io/github/issues/Sma1lo/gfs)
 
 A lightweight, high-performance file transfer tool designed for local networks. gfs uses UDP broadcast for automatic host discovery and TCP for reliable file transfer, allowing you to quickly share files between devices on the same network without any configuration. Simply run the command, select the target host, and transfer files with real-time progress feedback.
 > [!NOTE]
